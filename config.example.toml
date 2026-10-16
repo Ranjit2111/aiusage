@@ -1,0 +1,17 @@
+# aiusage plans: monthly renewals shown by `aiusage plans`.
+# renew_day = day of month the plan renews (1-31); 0 = not set yet.
+
+[[plans]]
+name = "Claude Pro"
+price = "$20/mo"
+renew_day = 0
+
+[[plans]]
+name = "ChatGPT Plus (Codex)"
+price = "$20/mo"
+renew_day = 0
+
+[[plans]]
+name = "OpenCode Go"
+price = "$10/mo"
+renew_day = 27   # derived from the usage API's monthly window

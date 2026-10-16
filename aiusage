@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""aiusage: one snapshot of every AI coding subscription: quota windows, reset times, renewals.
+
+Everything is read from this machine (credentials + local logs + the same endpoints the CLIs use):
+  claude   ~/.claude/.credentials.json  -> api.anthropic.com/api/oauth/usage  (what /usage shows)
+  codex    live `codex app-server` RPC  -> account/rateLimits/read
+             (fallback: newest rate_limits snapshot in $CODEX_HOME/sessions)
+  opencode credential in ~/.local/share/opencode/opencode.db
+                                        -> opencode.ai/zen/go/v1/usage
+Renewal dates: ~/.config/aiusage/config.toml
+
+Usage:
+  aiusage                everything, pretty
+  aiusage claude         one provider (claude | codex | opencode | plans)
+  aiusage --json         machine-readable
+  aiusage -v             extras + the ccusage token/cost table
+"""
+import argparse, calendar, glob, json, os, select, shutil, sqlite3, subprocess, sys, time, tomllib
+import urllib.error, urllib.request
+from datetime import date, datetime, timedelta, timezone
+
+VERSION = "0.1.0"
+IST = timezone(timedelta(hours=5, minutes=30))
+# opencode.ai sits behind Cloudflare; the default python UA gets blocked (error 1010)
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+CLAUDE_CREDS = os.path.expanduser("~/.claude/.credentials.json")
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+OPENCODE_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
+CONFIG = os.path.expanduser("~/.config/aiusage/config.toml")
+
+
+class CliError(Exception):
+    pass
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def read_json(path):
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def http_json(url, headers, timeout=20):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode(errors="replace")[:150]
+        except Exception:
+            pass
+        raise CliError(f"HTTP {e.code} {body}") from e
+
+
+def parse_ts(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return datetime.fromtimestamp(v, tz=timezone.utc)
+    return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+
+
+def fmt_dur(secs):
+    secs = int(max(0, secs))
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m"
+    return f"{s}s"
+
+
+def fmt_when(dt):
+    if dt is None:
+        return "reset time unknown"
+    rel = (dt - now()).total_seconds()
+    if 0 < rel < 86400:
+        return f"in {fmt_dur(rel)} ({dt.astimezone(IST):%H:%M} IST / {dt:%H:%M} UTC)"
+    return f"in {fmt_dur(rel)} ({dt.astimezone(IST):%a %d %b %H:%M} IST)"
+
+
+# ---------- display helpers ----------
+
+class C:
+    on = True
+
+
+def col(s, code):
+    return f"\x1b[{code}m{s}\x1b[0m" if C.on else str(s)
+
+
+def status_color(pct):
+    pct = pct or 0
+    return "32" if pct < 70 else "33" if pct < 90 else "31"
+
+
+def bar(pct, width=10):
+    filled = max(0, min(width, int((pct or 0) * width / 100 + 0.5)))
+    return "\u2588" * filled + "\u2591" * (width - filled)
+
+
+# ---------- claude ----------
+
+def fetch_claude():
+    try:
+        oauth = read_json(CLAUDE_CREDS).get("claudeAiOauth") or {}
+    except FileNotFoundError:
+        raise CliError("~/.claude/.credentials.json not found: log in with `claude`")
+    token = oauth.get("accessToken")
+    if not token:
+        raise CliError("no claudeAiOauth.accessToken: log in with `claude`")
+    # shortcut: no OAuth refresh implemented; if the hourly token expired, run `claude` once
+    # (it refreshes itself); upgrade path = POST console.anthropic.com/v1/oauth/token with the refresh token
+    try:
+        resp = http_json("https://api.anthropic.com/api/oauth/usage",
+                         {"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"})
+    except CliError as e:
+        if "HTTP 401" in str(e) or "HTTP 403" in str(e):
+            raise CliError("token expired/unauthorized: run `claude` once to refresh it, then retry")
+        raise
+    windows, extra = parse_claude(resp)
+    notes = []
+    exp = oauth.get("expiresAt")
+    if exp:
+        exp_dt = datetime.fromtimestamp(exp / 1000, tz=timezone.utc)
+        if exp_dt - now() < timedelta(minutes=15):
+            notes.append(f"access token expires in {fmt_dur((exp_dt - now()).total_seconds())}: run `claude` to refresh it")
+    return {"title": f"Claude ({oauth.get('subscriptionType') or '?'})",
+            "source": "oauth usage endpoint", "windows": windows, "notes": notes, "extra_usage": extra}
+
+
+def parse_claude(resp):
+    windows = []
+    for item in resp.get("limits") or []:
+        kind = item.get("kind") or "?"
+        scope = ((item.get("scope") or {}).get("model") or {}).get("display_name")
+        label = {"session": "session", "weekly_all": "weekly"}.get(kind) or (f"weekly {scope}" if scope else kind)
+        windows.append({"name": label, "percent": item.get("percent"),
+                        "resets_at": parse_ts(item.get("resets_at")), "severity": item.get("severity")})
+    if not windows:  # older accounts return the legacy flat shape
+        for key, label in (("five_hour", "session"), ("seven_day", "weekly"),
+                           ("seven_day_sonnet", "weekly sonnet"), ("seven_day_opus", "weekly opus")):
+            v = resp.get(key)
+            if isinstance(v, dict):
+                windows.append({"name": label, "percent": v.get("utilization"),
+                                "resets_at": parse_ts(v.get("resets_at")), "severity": None})
+    return windows, resp.get("extra_usage")
+
+
+# ---------- codex ----------
+
+def codex_rpc(timeout=25):
+    try:
+        proc = subprocess.Popen(["codex", "app-server"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise CliError("codex not found")
+    buf = ""
+    result = None
+    try:
+        def send(obj):
+            proc.stdin.write((json.dumps(obj) + "\n").encode())
+            proc.stdin.flush()
+
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"clientInfo": {"name": "aiusage", "version": VERSION}}})
+        deadline = time.time() + timeout
+        initialized = False
+        while time.time() < deadline and result is None:
+            r, _, _ = select.select([proc.stdout], [], [], 1.0)
+            if not r:
+                continue
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            buf += chunk.decode(errors="replace")
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("id") == 1 and "result" in msg and not initialized:
+                    initialized = True
+                    send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                    send({"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": {}})
+                elif msg.get("id") == 2 and "result" in msg:
+                    result = msg["result"]
+        if result is None:
+            raise CliError("codex app-server returned no rate limits")
+        return result
+    finally:
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
+def _codex_windows(rl):
+    wins = []
+    for lane in ("primary", "secondary"):
+        w = rl.get(lane) or {}
+        pct = w.get("usedPercent", w.get("used_percent"))
+        if pct is None:
+            continue
+        mins = w.get("windowDurationMins", w.get("window_minutes"))
+        label = "5h" if mins == 300 else "weekly" if mins == 10080 else f"{mins}m" if mins else lane
+        wins.append({"name": label, "percent": pct,
+                     "resets_at": parse_ts(w.get("resetsAt", w.get("resets_at"))), "severity": None})
+    return wins
+
+
+def parse_codex(rl):
+    credits = rl.get("credits") or {}
+    has = credits.get("hasCredits", credits.get("has_credits"))
+    if has:
+        note = "credits: unlimited" if credits.get("unlimited") else f"credits: ${credits.get('balance')}"
+    else:
+        note = "credits: none"
+    return {"windows": _codex_windows(rl),
+            "plan": rl.get("planType", rl.get("plan_type")) or "?",
+            "credit_note": note}
+
+
+def codex_snapshot():
+    files = glob.glob(os.path.join(CODEX_HOME, "sessions", "**", "*.jsonl"), recursive=True)
+    files += glob.glob(os.path.join(CODEX_HOME, "archived_sessions", "*.jsonl"))
+    files = [f for f in files if os.path.isfile(f)]
+    if not files:
+        raise CliError("no codex session files found")
+    files.sort(key=os.path.getmtime, reverse=True)
+    for path in files[:3]:
+        rl = _last_rate_limits(path)
+        if rl:
+            return rl, datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc)
+    raise CliError("no rate_limits snapshot in recent codex sessions")
+
+
+def _last_rate_limits(path, cap=8 * 1024 * 1024):
+    # shortcut: reverse scan of only the last 8 MiB of the session file; raise cap if needed
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        fh.seek(max(0, fh.tell() - cap))
+        data = fh.read()
+    for line in reversed(data.split(b"\n")):
+        if b'"rate_limits"' not in line:
+            continue
+        try:
+            rl = (json.loads(line).get("payload") or {}).get("rate_limits")
+        except ValueError:
+            continue
+        if rl:
+            return rl
+    return None
+
+
+def fetch_codex():
+    try:
+        rl = (codex_rpc().get("rateLimits")) or {}
+        src = "live · codex app-server"
+    except Exception:
+        rl, mtime = codex_snapshot()
+        src = f"snapshot from last codex run ({mtime.astimezone(IST):%d %b %H:%M} IST)"
+    parsed = parse_codex(rl)
+    return {"title": f"Codex ({parsed['plan']})", "source": src,
+            "windows": parsed["windows"], "notes": [parsed["credit_note"]]}
+
+
+# ---------- opencode ----------
+
+def parse_opencode(usage):
+    wins = []
+    for key, label in (("rolling", "rolling"), ("weekly", "weekly"), ("monthly", "monthly")):
+        w = usage.get(key) or {}
+        if w.get("percent") is None:
+            continue
+        status = w.get("status")
+        wins.append({"name": label, "percent": w.get("percent"),
+                     "resets_at": parse_ts(w.get("resetsAt")),
+                     "severity": None if status in (None, "ok") else status})
+    return wins
+
+
+def fetch_opencode():
+    if not os.path.exists(OPENCODE_DB):
+        raise CliError("opencode.db not found: log in with opencode")
+    con = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True)
+    try:
+        row = con.execute(
+            "select value from credential where integration_id='opencode' and active=1 "
+            "order by time_updated desc limit 1").fetchone()
+    except sqlite3.Error as e:
+        raise CliError(f"opencode.db: {e}") from e
+    if not row:
+        raise CliError("no active opencode credential: log in with opencode")
+    cred = json.loads(row[0])
+    key = cred.get("key") or cred.get("access")
+    if not key:
+        raise CliError("unrecognized opencode credential format")
+    usage = (http_json("https://opencode.ai/zen/go/v1/usage",
+                       {"Authorization": f"Bearer {key}"}) or {}).get("usage") or {}
+    return {"title": "OpenCode Go", "source": "zen/go/v1/usage",
+            "windows": parse_opencode(usage), "notes": []}
+
+
+FETCH = {"claude": fetch_claude, "codex": fetch_codex, "opencode": fetch_opencode}
+
+
+# ---------- plans ----------
+
+def next_renewal(day, today=None):
+    today = today or datetime.now(IST).date()
+    day = min(day, calendar.monthrange(today.year, today.month)[1])
+    cand = date(today.year, today.month, day)
+    if cand < today:
+        y, m = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+        cand = date(y, m, min(day, calendar.monthrange(y, m)[1]))
+    return cand
+
+
+def load_plans():
+    if not os.path.exists(CONFIG):
+        return []
+    doc = tomllib.load(open(CONFIG, "rb"))
+    out = []
+    for p in doc.get("plans", []):
+        day = int(p.get("renew_day") or 0)
+        out.append({"name": p.get("name") or "?", "price": p.get("price"),
+                    "renew_day": day, "next": next_renewal(day) if day else None})
+    return out
+
+
+# ---------- output ----------
+
+def win_json(w):
+    out = {"name": w["name"], "percent": w.get("percent")}
+    dt = w.get("resets_at")
+    if isinstance(dt, datetime):
+        out["resets_at"] = dt.isoformat(timespec="seconds")
+        out["resets_in_s"] = int((dt - now()).total_seconds())
+    if w.get("severity"):
+        out["severity"] = w["severity"]
+    return out
+
+
+def jsonable(data):
+    out = {"generated_at": data["generated_at"].isoformat(timespec="seconds"),
+           "providers": {}, "errors": data["errors"]}
+    for name, p in data["providers"].items():
+        item = {"title": p["title"], "source": p.get("source"),
+                "windows": [win_json(w) for w in p["windows"]], "notes": p.get("notes", [])}
+        if p.get("extra_usage"):
+            item["extra_usage"] = p["extra_usage"]
+        out["providers"][name] = item
+    if data["plans"] is not None:
+        out["plans"] = [{**pl, "next": pl["next"].isoformat() if pl.get("next") else None}
+                        for pl in data["plans"]]
+    return out
+
+
+def render(data, verbose):
+    t = now()
+    print(col(f"aiusage v{VERSION} · {t:%a %d %b %H:%M} UTC · {t.astimezone(IST):%H:%M} IST", "2"))
+    for name in ("claude", "codex", "opencode"):
+        if name in data["errors"]:
+            print(f"\n{col('\u26a0 ' + name, '31')}: {data['errors'][name]}")
+        if name not in data["providers"]:
+            continue
+        p = data["providers"][name]
+        print(f"\n{col(p['title'], '1')} {col('· ' + str(p.get('source') or ''), '2')}")
+        for w in p["windows"]:
+            pct = w.get("percent") or 0
+            sev = ""
+            if w.get("severity") and w["severity"] not in ("normal", "active", "ok"):
+                sev = "  " + col("\u26a0 " + str(w["severity"]), "31")
+            print(f"  {w['name']:<9} {col(bar(pct), status_color(pct))} "
+                  f"{col(f'{pct:>3.0f}%', status_color(pct))}  {fmt_when(w.get('resets_at'))}{sev}")
+        for n in p.get("notes", []):
+            print(f"  {col(n, '2')}")
+        if verbose and p.get("extra_usage"):
+            e = p["extra_usage"]
+            print("  " + col(f"extra_usage: enabled={e.get('is_enabled')} used={e.get('used_credits')}", "2"))
+    if data["plans"]:
+        print(f"\n{col('Plans', '1')}")
+        for pl in data["plans"]:
+            price = f"  {col(pl['price'], '2')}" if pl.get("price") else ""
+            if pl["next"]:
+                days = (pl["next"] - datetime.now(IST).date()).days
+                print(f"  {pl['name']:<24} renews in {days}d ({pl['next']:%d %b}){price}")
+            else:
+                print(f"  {pl['name']:<24} {col('renew_day not set \u2192 ~/.config/aiusage/config.toml', '2')}")
+    if verbose and data["providers"]:
+        print(f"\n{col('Token & cost usage (ccusage)', '1')}")
+        exe = shutil.which("ccusage")
+        if not exe:
+            print("  ccusage not installed: npm i -g ccusage")
+        else:
+            try:
+                out = subprocess.run([exe], capture_output=True, text=True, timeout=180)
+                print(out.stdout.rstrip())
+            except Exception as e:
+                print(f"  ccusage failed: {e}")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="aiusage",
+                                 description="quota snapshot for Claude Code, Codex and OpenCode Go")
+    ap.add_argument("provider", nargs="?", default="all",
+                    choices=["all", "claude", "codex", "opencode", "plans"])
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--version", action="version", version=f"aiusage {VERSION}")
+    args = ap.parse_args(argv)
+    if args.no_color or os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        C.on = False
+
+    if args.provider == "all":
+        wanted = ["claude", "codex", "opencode"]
+    elif args.provider == "plans":
+        wanted = []
+    else:
+        wanted = [args.provider]
+
+    data = {"providers": {}, "errors": {}, "plans": None, "generated_at": now()}
+    for name in wanted:
+        try:
+            data["providers"][name] = FETCH[name]()
+        except Exception as e:
+            data["errors"][name] = str(e)
+    if args.provider in ("all", "plans"):
+        data["plans"] = load_plans()
+
+    if args.json:
+        print(json.dumps(jsonable(data), indent=2))
+    else:
+        render(data, args.verbose)
+    return 1 if data["errors"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
