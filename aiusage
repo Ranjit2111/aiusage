@@ -19,11 +19,14 @@ import argparse, calendar, glob, json, os, select, shutil, sqlite3, subprocess, 
 import urllib.error, urllib.request
 from datetime import date, datetime, timedelta, timezone
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 IST = timezone(timedelta(hours=5, minutes=30))
 # opencode.ai sits behind Cloudflare; the default python UA gets blocked (error 1010)
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 CLAUDE_CREDS = os.path.expanduser("~/.claude/.credentials.json")
+CLAUDE_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
+CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code's public OAuth client
+CLAUDE_UA = "claude-code/2.1.301"  # Anthropic's edge rejects the default python UA
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 OPENCODE_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
 CONFIG = os.path.expanduser("~/.config/aiusage/config.toml")
@@ -109,32 +112,94 @@ def bar(pct, width=10):
 
 # ---------- claude ----------
 
+def _claude_usage(token):
+    return http_json("https://api.anthropic.com/api/oauth/usage",
+                     {"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"})
+
+
+def _identity(creds):
+    oauth = creds.get("claudeAiOauth") or {}
+    return oauth.get("accessToken"), oauth.get("refreshToken")
+
+
+def _persist_creds(updated, ident):
+    # never clobber tokens Claude Code rotated while we were refreshing
+    try:
+        latest = read_json(CLAUDE_CREDS)
+    except Exception:
+        latest = None
+    if latest and _identity(latest) != ident:
+        return latest
+    if latest:
+        updated = {**latest, **updated,
+                   "claudeAiOauth": {**(latest.get("claudeAiOauth") or {}),
+                                     **(updated.get("claudeAiOauth") or {})}}
+    tmp = CLAUDE_CREDS + ".aiusage.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(updated, fh)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CLAUDE_CREDS)
+    return updated
+
+
+def claude_refresh(creds):
+    """Exchange the OAuth refresh token and persist the rotated credentials.
+
+    Anthropic rotates refresh tokens, so the new one must be written back to
+    .credentials.json or Claude Code's stored copy goes stale (logged out).
+    """
+    ident = _identity(creds)
+    oauth = dict(creds.get("claudeAiOauth") or {})
+    rt = oauth.get("refreshToken")
+    if not rt:
+        raise CliError("claude token expired and no refreshToken: run `claude` to log in")
+    body = json.dumps({"grant_type": "refresh_token", "refresh_token": rt,
+                       "client_id": CLAUDE_CLIENT_ID}).encode()
+    req = urllib.request.Request(CLAUDE_TOKEN_URL, data=body,
+                                 headers={"Content-Type": "application/json", "User-Agent": CLAUDE_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.load(resp)
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        try:
+            latest = read_json(CLAUDE_CREDS)
+            if _identity(latest) != ident:
+                return latest  # Claude Code refreshed first; its tokens win
+        except Exception:
+            pass
+        raise CliError(f"claude token refresh failed ({getattr(e, 'code', e)}): run `claude` once") from e
+    oauth["accessToken"] = result["access_token"]
+    if result.get("refresh_token"):
+        oauth["refreshToken"] = result["refresh_token"]
+    oauth["expiresAt"] = int(time.time() * 1000 + int(result.get("expires_in", 3600)) * 1000)
+    return _persist_creds({**creds, "claudeAiOauth": oauth}, ident)
+
+
 def fetch_claude():
     try:
-        oauth = read_json(CLAUDE_CREDS).get("claudeAiOauth") or {}
+        creds = read_json(CLAUDE_CREDS)
     except FileNotFoundError:
         raise CliError("~/.claude/.credentials.json not found: log in with `claude`")
-    token = oauth.get("accessToken")
-    if not token:
+    oauth = creds.get("claudeAiOauth") or {}
+    if not oauth.get("accessToken"):
         raise CliError("no claudeAiOauth.accessToken: log in with `claude`")
-    # shortcut: no OAuth refresh implemented; if the hourly token expired, run `claude` once
-    # (it refreshes itself); upgrade path = POST console.anthropic.com/v1/oauth/token with the refresh token
+    if time.time() * 1000 > oauth.get("expiresAt", 0) - 60_000:
+        creds = claude_refresh(creds)
+    token = (creds.get("claudeAiOauth") or {}).get("accessToken")
     try:
-        resp = http_json("https://api.anthropic.com/api/oauth/usage",
-                         {"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"})
+        resp = _claude_usage(token)
     except CliError as e:
-        if "HTTP 401" in str(e) or "HTTP 403" in str(e):
-            raise CliError("token expired/unauthorized: run `claude` once to refresh it, then retry")
-        raise
+        if "HTTP 401" not in str(e) and "HTTP 403" not in str(e):
+            raise
+        creds = claude_refresh(creds)  # rejected mid-flight: refresh once, retry once
+        try:
+            resp = _claude_usage((creds.get("claudeAiOauth") or {}).get("accessToken"))
+        except CliError as e2:
+            raise CliError(f"claude usage rejected even after refresh ({e2}): run `claude`") from e2
+    oauth = creds.get("claudeAiOauth") or oauth
     windows, extra = parse_claude(resp)
-    notes = []
-    exp = oauth.get("expiresAt")
-    if exp:
-        exp_dt = datetime.fromtimestamp(exp / 1000, tz=timezone.utc)
-        if exp_dt - now() < timedelta(minutes=15):
-            notes.append(f"access token expires in {fmt_dur((exp_dt - now()).total_seconds())}: run `claude` to refresh it")
     return {"title": f"Claude ({oauth.get('subscriptionType') or '?'})",
-            "source": "oauth usage endpoint", "windows": windows, "notes": notes, "extra_usage": extra}
+            "source": "oauth usage endpoint", "windows": windows, "notes": [], "extra_usage": extra}
 
 
 def parse_claude(resp):
