@@ -220,5 +220,61 @@ class Timezone(unittest.TestCase):
         self.assertFalse(au.load_config().get("timezone"))
 
 
+class Setup(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self._cfg = au.CONFIG
+        au.CONFIG = os.path.join(self.home, ".config", "aiusage", "config.toml")
+        self.bin = os.path.join(self.home, ".local", "bin")
+        self.link = os.path.join(self.bin, "aiusage")
+
+    def tearDown(self):
+        au.CONFIG = self._cfg
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def run_setup(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = au.setup_command(home=self.home)
+        return rc, buf.getvalue()
+
+    def test_first_run_links_and_rerun_is_quiet(self):
+        rc, out = self.run_setup()
+        self.assertEqual(rc, 0)
+        self.assertIn("setup:", out)
+        self.assertIn("linked aiusage into", out)
+        self.assertTrue(os.path.islink(self.link))
+        self.assertEqual(os.path.realpath(self.link), os.path.realpath(au.__file__))
+        self.assertTrue(os.access(self.link, os.X_OK))
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = self.bin + os.pathsep + old_path
+        try:
+            _, again = self.run_setup()
+        finally:
+            os.environ["PATH"] = old_path
+        self.assertIn("setup already done.", again)
+        self.assertNotIn("linked", again)
+
+    def test_mentions_the_path_line_when_needed(self):
+        _, out = self.run_setup()
+        self.assertIn("is not on your PATH", out)
+        self.assertIn('export PATH="$HOME/.local/bin:$PATH"', out)
+
+    def test_leaves_a_foreign_symlink_alone(self):
+        os.makedirs(self.bin)
+        other = os.path.join(self.home, "other")
+        with open(other, "w") as fh:
+            fh.write("x")
+        os.symlink(other, self.link)
+        _, out = self.run_setup()
+        self.assertIn("nothing changed", out)
+        self.assertIn("belongs to something else", out)
+        self.assertEqual(os.path.realpath(self.link), os.path.realpath(other))
+
+    def test_setup_takes_no_argument(self):
+        with self.assertRaises(SystemExit):
+            au.main(["setup", "Asia/Tokyo"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

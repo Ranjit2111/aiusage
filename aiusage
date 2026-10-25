@@ -172,6 +172,56 @@ def write_timezone(name):
     os.replace(tmp, CONFIG)
 
 
+def setup_command(home=None):
+    """Put the command on PATH. Safe to run again."""
+    home = home or os.path.expanduser("~")
+    bindir = os.path.join(home, ".local", "bin")
+    link = os.path.join(bindir, "aiusage")
+    me = os.path.realpath(__file__)
+    done, todo = [], []
+    conflict = False
+
+    def pretty(path):
+        return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+    if not os.path.isdir(bindir):
+        os.makedirs(bindir, exist_ok=True)
+        done.append(f"created {pretty(bindir)}")
+
+    if os.path.islink(link) and os.path.realpath(link) == me:
+        pass
+    elif os.path.lexists(link):
+        conflict = True
+        todo.append(f"{pretty(link)} already exists and belongs to something else: "
+                    f"{os.path.realpath(link)}\n"
+                    "  delete it if you want this copy to be the one that runs")
+    else:
+        os.symlink(me, link)
+        done.append(f"linked aiusage into {pretty(bindir)}")
+
+    if not os.stat(me).st_mode & 0o111:
+        os.chmod(me, os.stat(me).st_mode | 0o755)
+        done.append("made aiusage runnable")
+
+    on_path = {os.path.realpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p}
+    if os.path.realpath(bindir) not in on_path:
+        todo.append(f"{pretty(bindir)} is not on your PATH. Add this line to your shell profile "
+                    "(~/.bashrc or ~/.zshrc):\n"
+                    '    export PATH="$HOME/.local/bin:$PATH"')
+
+    if done:
+        print("setup:")
+    elif todo:
+        print("setup: nothing changed.")
+    else:
+        print("setup already done.")
+    for line in done + todo:
+        print(f"  {line}")
+    if not conflict and not load_config().get("timezone"):
+        print("  next: aiusage tz Asia/Kolkata sets the time you see (UTC until then)")
+    return 0
+
+
 def tz_command(target):
     current = load_config().get("timezone")
     if not target:
@@ -574,14 +624,24 @@ def render(data, verbose):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="aiusage",
-                                 description="quota snapshot for Claude Code, Codex and OpenCode Go")
+    ap = argparse.ArgumentParser(
+        prog="aiusage",
+        description="Quota snapshot for Claude Code, Codex and OpenCode Go.",
+        epilog="examples:\n"
+               "  aiusage                     all three, pretty\n"
+               "  aiusage codex               one provider\n"
+               "  aiusage --json              machine readable\n"
+               "  aiusage tz Asia/Kolkata     set your timezone\n"
+               "  aiusage setup               link it into ~/.local/bin\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("provider", nargs="?", default="all",
-                    choices=["all", "claude", "codex", "opencode", "plans", "tz"])
-    ap.add_argument("zone", nargs="?", help="with 'tz': city, alias or IANA name")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    ap.add_argument("--json", action="store_true")
-    ap.add_argument("--no-color", action="store_true")
+                    choices=["all", "claude", "codex", "opencode", "plans", "tz", "setup"],
+                    help="what to show (default: all), or 'tz' / 'setup'")
+    ap.add_argument("value", nargs="?", help="timezone name, used by 'tz'")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="add extras and the ccusage token/cost table")
+    ap.add_argument("--json", action="store_true", help="machine readable output")
+    ap.add_argument("--no-color", action="store_true", help="no colours")
     ap.add_argument("--color", action="store_true", help="keep colours even when piped")
     ap.add_argument("--version", action="version", version=f"aiusage {VERSION}")
     args = ap.parse_args(argv)
@@ -591,9 +651,13 @@ def main(argv=None):
         C.on = False
 
     if args.provider == "tz":
-        return tz_command(args.zone)
-    if args.zone:
-        ap.error(f"unexpected argument: {args.zone}")
+        return tz_command(args.value)
+    if args.provider == "setup":
+        if args.value:
+            ap.error("setup takes no arguments")
+        return setup_command()
+    if args.value:
+        ap.error(f"unexpected argument: {args.value}")
     set_display_zone()
 
     if args.provider == "all":

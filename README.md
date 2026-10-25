@@ -19,6 +19,7 @@ I got tired of checking three dashboards before starting a long agent run, so th
 | `aiusage -v` | extras plus the `ccusage` token and cost table |
 | `aiusage tz` | show the current timezone |
 | `aiusage tz Asia/Kolkata` | set it, once |
+| `aiusage setup` | link it into `~/.local/bin` and check your PATH |
 
 Colours switch off when the output is piped; `--color` forces them on, `--no-color` or `NO_COLOR` turns them off.
 
@@ -52,14 +53,15 @@ Nothing is uploaded anywhere. The only network calls are to those provider endpo
 Needs Python 3.11 or newer (for `tomllib`), and any of the CLIs you want a section for must be logged in.
 
 ```sh
-git clone https://github.com/Ranjit2111/aiusage.git ~/repos/aiusage
-chmod +x ~/repos/aiusage/aiusage
-mkdir -p ~/.local/bin ~/.config/aiusage
-ln -sf ~/repos/aiusage/aiusage ~/.local/bin/aiusage
-aiusage tz Asia/Kolkata                                # optional, UTC by default
+git clone https://github.com/Ranjit2111/aiusage.git
+cd aiusage
+./aiusage setup
+aiusage tz Asia/Kolkata
 ```
 
-`~/.local/bin` has to be on `PATH`. `git pull` updates in place, the symlink keeps working.
+Clone it wherever you keep code, the steps do not care about the folder. `setup` links the command into `~/.local/bin` and tells you if that directory is not on your PATH: paste the line it prints, then open a new shell. It is safe to run again, and if everything is already in place it says so and changes nothing. Your timezone is the only thing it does not touch, `aiusage tz` owns that. `git pull` in the clone updates in place, the link keeps working. If you move the folder, run `./aiusage setup` there again to repoint the link.
+
+Plans in `aiusage plans` come from `~/.config/aiusage/config.toml`. Copy `config.example.toml` there to start, and set `renew_day` per plan.
 
 ## Tests
 
@@ -67,7 +69,7 @@ aiusage tz Asia/Kolkata                                # optional, UTC by defaul
 python3 tests/test_parsers.py
 ```
 
-The parsers and the timezone config are the parts that break quietly, so those are what the tests cover.
+The parsers, the timezone config and the setup command are the parts that break quietly, so those are what the tests cover.
 
 ## Caveats
 
@@ -76,3 +78,7 @@ The parsers and the timezone config are the parts that break quietly, so those a
 - `aiusage plans` reads `~/.config/aiusage/config.toml`; `renew_day` is the day of the month the plan renews, and 0 means unset. Copy `config.example.toml` there to start.
 - The OpenCode section reports the Go plan of the account logged into the console on that machine.
 - Tested on Linux. It relies on the Unix `select` call, which macOS also has.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
