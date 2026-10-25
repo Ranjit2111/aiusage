@@ -2,28 +2,11 @@
 
 Prints how much of each AI coding subscription is left, and when it resets. Claude Code, Codex and OpenCode Go on one screen.
 
+![aiusage output](assets/aiusage.png)
+
+*Example output. Times follow the timezone in your config.*
+
 I got tired of checking three dashboards before starting a long agent run, so this reads the same local credentials and endpoints the CLIs use and puts the result in one place.
-
-```
-$ aiusage
-aiusage v0.2.0 · Fri 16 Oct 16:05 UTC · 21:35 IST
-
-Claude (pro) · oauth usage endpoint
-  session   █████████░  90%  in 15m (16:20 UTC)  ⚠ critical
-  weekly    ███░░░░░░░  31%  in 2d 2h (Sun 18 Oct)
-
-Codex (plus) · live · codex app-server
-  5h        ████████░░  85%  in 1h 52m (16:57 UTC)
-  weekly    ███░░░░░░░  29%  in 6d 16h (Thu 22 Oct)
-
-OpenCode Go · zen/go/v1/usage
-  rolling   █░░░░░░░░░   6%  in 6m (13:07 UTC)
-  weekly    ██████░░░░  63%  in 2d 8h (Mon 19 Oct)
-  monthly   ███░░░░░░░  32%  in 10d 13h (Tue 27 Oct)
-
-Plans
-  Claude Pro               renews in 8d (24 Oct)
-```
 
 ## Commands
 
@@ -32,10 +15,27 @@ Plans
 | `aiusage` | all three providers, pretty |
 | `aiusage claude` / `codex` / `opencode` | one provider |
 | `aiusage plans` | renewal countdowns only |
-| `aiusage --json` | machine readable, exit 1 if any provider errored |
+| `aiusage --json` | machine readable, includes the `timezone` in use, exit 1 if any provider errored |
 | `aiusage -v` | extras plus the `ccusage` token and cost table |
+| `aiusage tz` | show the current timezone |
+| `aiusage tz Asia/Kolkata` | set it, once |
 
-Colours switch off when the output is piped; force with `--no-color`, or set `NO_COLOR`.
+Colours switch off when the output is piped; `--color` forces them on, `--no-color` or `NO_COLOR` turns them off.
+
+## Timezones
+
+Every time printed is in one zone: the one in your config, or UTC if you never set one. No dual clocks to read around.
+
+```sh
+aiusage tz                  # what is set now
+aiusage tz Asia/Kolkata     # set it, once
+```
+
+It takes an IANA timezone name: `Asia/Kolkata`, `Europe/Berlin`, `America/New_York`. Lowercase is fine, and `aiusage tz utc` goes back to the default.
+
+Not sure which name is yours? Search online for your city plus "IANA timezone", or look at the tz database list, which has the exact name for every zone. Google usually answers with a plain label like "Indian Standard Time", which is not the name this needs. If you pass one that is not a zone name, you are told so, not silently given a different zone.
+
+The value lands in `~/.config/aiusage/config.toml` as `timezone = "..."` and is used from then on.
 
 ## Where the numbers come from
 
@@ -56,7 +56,7 @@ git clone https://github.com/Ranjit2111/aiusage.git ~/repos/aiusage
 chmod +x ~/repos/aiusage/aiusage
 mkdir -p ~/.local/bin ~/.config/aiusage
 ln -sf ~/repos/aiusage/aiusage ~/.local/bin/aiusage
-cp ~/repos/aiusage/config.example.toml ~/.config/aiusage/config.toml   # then set renew_day per plan
+aiusage tz Asia/Kolkata                                # optional, UTC by default
 ```
 
 `~/.local/bin` has to be on `PATH`. `git pull` updates in place, the symlink keeps working.
@@ -67,12 +67,12 @@ cp ~/repos/aiusage/config.example.toml ~/.config/aiusage/config.toml   # then se
 python3 tests/test_parsers.py
 ```
 
-The parsers are the fragile part, so those are what the tests cover, using recorded provider responses.
+The parsers and the timezone config are the parts that break quietly, so those are what the tests cover.
 
 ## Caveats
 
 - The Anthropic usage endpoint and the OpenCode usage endpoint are undocumented. They are the ones the CLIs and console call, so they can change without notice. When one does, only that section errors out and the rest still print.
 - Claude access tokens expire hourly. aiusage refreshes the token itself and writes the rotated credentials back to `~/.claude/.credentials.json`, the same file Claude Code uses, so both stay valid. If a refresh is rejected, run `claude` once to log in again.
-- `aiusage plans` reads `~/.config/aiusage/config.toml`. `renew_day` is the day of the month the plan renews, and 0 means unset.
+- `aiusage plans` reads `~/.config/aiusage/config.toml`; `renew_day` is the day of the month the plan renews, and 0 means unset. Copy `config.example.toml` there to start.
 - The OpenCode section reports the Go plan of the account logged into the console on that machine.
 - Tested on Linux. It relies on the Unix `select` call, which macOS also has.
