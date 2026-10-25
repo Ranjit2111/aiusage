@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""aiusage: one snapshot of every AI coding subscription: quota windows, reset times, renewals.
+"""aiusage: one snapshot of every AI coding subscription (quota windows, reset times, renewals).
 
 Everything is read from this machine (credentials + local logs + the same endpoints the CLIs use):
   claude   ~/.claude/.credentials.json  -> api.anthropic.com/api/oauth/usage  (what /usage shows)
@@ -18,9 +18,11 @@ Usage:
 import argparse, calendar, glob, json, os, select, shutil, sqlite3, subprocess, sys, time, tomllib
 import urllib.error, urllib.request
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
-VERSION = "0.2.0"
-IST = timezone(timedelta(hours=5, minutes=30))
+VERSION = "0.3.0"
+ZONE = timezone.utc        # display timezone, replaced from config at startup
+ZONE_NAME = "UTC"
 # opencode.ai sits behind Cloudflare; the default python UA gets blocked (error 1010)
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 CLAUDE_CREDS = os.path.expanduser("~/.claude/.credentials.json")
@@ -85,9 +87,102 @@ def fmt_when(dt):
     if dt is None:
         return "reset time unknown"
     rel = (dt - now()).total_seconds()
+    local = dt.astimezone(ZONE)
     if 0 < rel < 86400:
-        return f"in {fmt_dur(rel)} ({dt.astimezone(IST):%H:%M} IST / {dt:%H:%M} UTC)"
-    return f"in {fmt_dur(rel)} ({dt.astimezone(IST):%a %d %b %H:%M} IST)"
+        return f"in {fmt_dur(rel)} ({local:%H:%M})"
+    return f"in {fmt_dur(rel)} ({local:%a %d %b %H:%M})"
+
+
+# ---------- config ----------
+
+def load_config():
+    if not os.path.exists(CONFIG):
+        return {}
+    with open(CONFIG, "rb") as fh:
+        try:
+            return tomllib.load(fh)
+        except tomllib.TOMLDecodeError as e:
+            raise CliError(f"{CONFIG}: {e}") from e
+
+
+def canonical_zone(token):
+    """Exactly an IANA name (/Area/City), forgiving case and spaces. Nothing else."""
+    key = " ".join(token.split()).replace(" ", "_").lower()
+    for zone in available_timezones():
+        if zone.lower() == key:
+            return zone
+    raise CliError(
+        f'"{token}" is not an IANA timezone.\n'
+        f'Search online for "{token} IANA timezone" and use the name you get, which looks like Asia/Kolkata:\n'
+        "  aiusage tz Asia/Kolkata"
+    )
+
+
+def set_display_zone(cfg=None):
+    global ZONE, ZONE_NAME
+    cfg = load_config() if cfg is None else cfg
+    raw = cfg.get("timezone")
+    name = "UTC"
+    if isinstance(raw, str) and raw.strip():
+        try:
+            name = canonical_zone(raw)
+        except CliError as e:
+            raise CliError(f'"{raw}" in {CONFIG} is not an IANA timezone. '
+                           "Search online for its IANA name, then run: aiusage tz Asia/Kolkata") from e
+    ZONE = ZoneInfo(name)
+    ZONE_NAME = name
+
+
+def zshort(local):
+    """Abbreviation when the zone has one, else an offset like UTC+4."""
+    name = local.tzname() or ""
+    if name and name[0] not in "+-":
+        return name
+    return f"UTC{local.utcoffset().total_seconds() / 3600:+g}"
+
+
+def zlabel(dt=None):
+    return zshort((dt or now()).astimezone(ZONE))
+
+
+def write_timezone(name):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    lines = []
+    if os.path.exists(CONFIG):
+        with open(CONFIG, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    entry = f'timezone = "{name}"'
+    first_table = next((i for i, ln in enumerate(lines) if ln.lstrip().startswith("[")), None)
+    idx = next((i for i, ln in enumerate(lines) if ln.split("#", 1)[0].strip().startswith("timezone")), None)
+    if idx is not None and (first_table is None or idx < first_table):
+        lines[idx] = entry
+    else:
+        if idx is not None:                       # key buried inside a table: lift it to the top level
+            del lines[idx]
+            if first_table is not None and idx < first_table:
+                first_table -= 1
+        at = first_table if first_table is not None else len(lines)
+        lines[at:at] = [entry, ""] if first_table is not None else [entry]
+    text = "\n".join(lines).rstrip("\n") + "\n"
+    if tomllib.loads(text).get("timezone") != name:   # refuses to touch a file it would corrupt
+        raise CliError(f"could not set timezone in {CONFIG}")
+    tmp = f"{CONFIG}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, CONFIG)
+
+
+def tz_command(target):
+    current = load_config().get("timezone")
+    if not target:
+        print(f"timezone: {current or 'UTC (default)'}")
+        print(col("  change: aiusage tz Asia/Kolkata      search online for \"<city> IANA timezone\" if unsure", "2"))
+        return 0
+    name = canonical_zone(target)
+    write_timezone(name)
+    local = now().astimezone(ZoneInfo(name))
+    print(f"timezone: {name} ({local:%H:%M} {zshort(local)}), saved in {CONFIG}")
+    return 0
 
 
 # ---------- display helpers ----------
@@ -334,7 +429,7 @@ def fetch_codex():
         src = "live · codex app-server"
     except Exception:
         rl, mtime = codex_snapshot()
-        src = f"snapshot from last codex run ({mtime.astimezone(IST):%d %b %H:%M} IST)"
+        src = f"snapshot from last codex run ({mtime.astimezone(ZONE):%d %b %H:%M} {zlabel(mtime)})"
     parsed = parse_codex(rl)
     return {"title": f"Codex ({parsed['plan']})", "source": src,
             "windows": parsed["windows"], "notes": [parsed["credit_note"]]}
@@ -383,7 +478,7 @@ FETCH = {"claude": fetch_claude, "codex": fetch_codex, "opencode": fetch_opencod
 # ---------- plans ----------
 
 def next_renewal(day, today=None):
-    today = today or datetime.now(IST).date()
+    today = today or datetime.now(ZONE).date()
     day = min(day, calendar.monthrange(today.year, today.month)[1])
     cand = date(today.year, today.month, day)
     if cand < today:
@@ -419,6 +514,7 @@ def win_json(w):
 
 def jsonable(data):
     out = {"generated_at": data["generated_at"].isoformat(timespec="seconds"),
+           "timezone": ZONE_NAME,
            "providers": {}, "errors": data["errors"]}
     for name, p in data["providers"].items():
         item = {"title": p["title"], "source": p.get("source"),
@@ -434,7 +530,8 @@ def jsonable(data):
 
 def render(data, verbose):
     t = now()
-    print(col(f"aiusage v{VERSION} · {t:%a %d %b %H:%M} UTC · {t.astimezone(IST):%H:%M} IST", "2"))
+    t = t.astimezone(ZONE)
+    print(col(f"{t:%a %d %b %H:%M} {zlabel(t)}", "2"))
     for name in ("claude", "codex", "opencode"):
         if name in data["errors"]:
             print(f"\n{col('\u26a0 ' + name, '31')}: {data['errors'][name]}")
@@ -459,7 +556,7 @@ def render(data, verbose):
         for pl in data["plans"]:
             price = f"  {col(pl['price'], '2')}" if pl.get("price") else ""
             if pl["next"]:
-                days = (pl["next"] - datetime.now(IST).date()).days
+                days = (pl["next"] - datetime.now(ZONE).date()).days
                 print(f"  {pl['name']:<24} renews in {days}d ({pl['next']:%d %b}){price}")
             else:
                 print(f"  {pl['name']:<24} {col('renew_day not set \u2192 ~/.config/aiusage/config.toml', '2')}")
@@ -480,14 +577,24 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="aiusage",
                                  description="quota snapshot for Claude Code, Codex and OpenCode Go")
     ap.add_argument("provider", nargs="?", default="all",
-                    choices=["all", "claude", "codex", "opencode", "plans"])
+                    choices=["all", "claude", "codex", "opencode", "plans", "tz"])
+    ap.add_argument("zone", nargs="?", help="with 'tz': city, alias or IANA name")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--color", action="store_true", help="keep colours even when piped")
     ap.add_argument("--version", action="version", version=f"aiusage {VERSION}")
     args = ap.parse_args(argv)
-    if args.no_color or os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+    if args.color:
+        C.on = True
+    elif args.no_color or os.environ.get("NO_COLOR") or not sys.stdout.isatty():
         C.on = False
+
+    if args.provider == "tz":
+        return tz_command(args.zone)
+    if args.zone:
+        ap.error(f"unexpected argument: {args.zone}")
+    set_display_zone()
 
     if args.provider == "all":
         wanted = ["claude", "codex", "opencode"]
@@ -513,4 +620,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except CliError as e:
+        print(f"aiusage: {e}", file=sys.stderr)
+        sys.exit(2)
