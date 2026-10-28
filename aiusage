@@ -20,7 +20,7 @@ import urllib.error, urllib.request
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 ZONE = timezone.utc        # display timezone, replaced from config at startup
 ZONE_NAME = "UTC"
 # opencode.ai sits behind Cloudflare; the default python UA gets blocked (error 1010)
@@ -255,6 +255,12 @@ def bar(pct, width=10):
     return "\u2588" * filled + "\u2591" * (width - filled)
 
 
+def inactive(title, note):
+    """A subscription that ended: nothing to meter, but not a read failure."""
+    return {"title": title, "source": "plan not active", "windows": [], "notes": [note],
+            "state": "inactive"}
+
+
 # ---------- claude ----------
 
 def _claude_usage(token):
@@ -265,6 +271,11 @@ def _claude_usage(token):
 def _identity(creds):
     oauth = creds.get("claudeAiOauth") or {}
     return oauth.get("accessToken"), oauth.get("refreshToken")
+
+
+def claude_title(oauth):
+    sub = oauth.get("subscriptionType")
+    return f"Claude ({sub})" if sub else "Claude"
 
 
 def _persist_creds(updated, ident):
@@ -334,6 +345,11 @@ def fetch_claude():
     try:
         resp = _claude_usage(token)
     except CliError as e:
+        if "HTTP 403" in str(e) and ("permission_error" in str(e) or "not allowed for this organization" in str(e)):
+            # a lapsed or cancelled subscription, not a bad token: refreshing cannot help
+            return inactive(claude_title(oauth),
+                            "the Claude subscription behind this login has ended, so there is no quota "
+                            "to read. Renew it, then run `claude` once to sign in again.")
         if "HTTP 401" not in str(e) and "HTTP 403" not in str(e):
             raise
         creds = claude_refresh(creds)  # rejected mid-flight: refresh once, retry once
@@ -343,7 +359,7 @@ def fetch_claude():
             raise CliError(f"claude usage rejected even after refresh ({e2}): run `claude`") from e2
     oauth = creds.get("claudeAiOauth") or oauth
     windows, extra = parse_claude(resp)
-    return {"title": f"Claude ({oauth.get('subscriptionType') or '?'})",
+    return {"title": claude_title(oauth),
             "source": "oauth usage endpoint", "windows": windows, "notes": [], "extra_usage": extra}
 
 
@@ -481,8 +497,16 @@ def fetch_codex():
         rl, mtime = codex_snapshot()
         src = f"snapshot from last codex run ({mtime.astimezone(ZONE):%d %b %H:%M} {zlabel(mtime)})"
     parsed = parse_codex(rl)
+    if not parsed["windows"]:
+        # an expired plan still answers, with a snapshot that has no windows and often no plan type
+        title = "Codex" if parsed["plan"] == "?" else f"Codex ({parsed['plan']})"
+        return inactive(title, "no quota windows on this account: the ChatGPT plan is not active. "
+                               "Renew it, then run `codex` once.")
+    notes = [parsed["credit_note"]]
+    if parsed["plan"] in ("free", "guest"):
+        notes.append(f"plan not active: on the {parsed['plan']} plan, no paid ChatGPT quota")
     return {"title": f"Codex ({parsed['plan']})", "source": src,
-            "windows": parsed["windows"], "notes": [parsed["credit_note"]]}
+            "windows": parsed["windows"], "notes": notes}
 
 
 # ---------- opencode ----------
@@ -516,10 +540,21 @@ def fetch_opencode():
     key = cred.get("key") or cred.get("access")
     if not key:
         raise CliError("unrecognized opencode credential format")
-    usage = (http_json("https://opencode.ai/zen/go/v1/usage",
-                       {"Authorization": f"Bearer {key}"}) or {}).get("usage") or {}
+    try:
+        usage = (http_json("https://opencode.ai/zen/go/v1/usage",
+                           {"Authorization": f"Bearer {key}"}) or {}).get("usage") or {}
+    except CliError as e:
+        # 403 "OpenCode Go subscription required" is the lapsed plan; a Cloudflare 403 must stay an error
+        if "HTTP 403" not in str(e) or "subscription" not in str(e).lower():
+            raise
+        return inactive("OpenCode Go", "the Go subscription behind this key is not active. "
+                                       "Renew it, then log in with `opencode`.")
+    windows = parse_opencode(usage)
+    if not windows:
+        return inactive("OpenCode Go", "no usage windows for this account: the Go plan is not active. "
+                                       "Renew it, then log in with `opencode`.")
     return {"title": "OpenCode Go", "source": "zen/go/v1/usage",
-            "windows": parse_opencode(usage), "notes": []}
+            "windows": windows, "notes": []}
 
 
 FETCH = {"claude": fetch_claude, "codex": fetch_codex, "opencode": fetch_opencode}
@@ -569,6 +604,8 @@ def jsonable(data):
     for name, p in data["providers"].items():
         item = {"title": p["title"], "source": p.get("source"),
                 "windows": [win_json(w) for w in p["windows"]], "notes": p.get("notes", [])}
+        if p.get("state"):
+            item["state"] = p["state"]
         if p.get("extra_usage"):
             item["extra_usage"] = p["extra_usage"]
         out["providers"][name] = item
@@ -588,7 +625,8 @@ def render(data, verbose):
         if name not in data["providers"]:
             continue
         p = data["providers"][name]
-        print(f"\n{col(p['title'], '1')} {col('· ' + str(p.get('source') or ''), '2')}")
+        src_col = "33" if p.get("state") == "inactive" else "2"
+        print(f"\n{col(p['title'], '1')} {col('· ' + str(p.get('source') or ''), src_col)}")
         for w in p["windows"]:
             pct = w.get("percent") or 0
             sev = ""
@@ -605,9 +643,12 @@ def render(data, verbose):
         print(f"\n{col('Plans', '1')}")
         for pl in data["plans"]:
             price = f"  {col(pl['price'], '2')}" if pl.get("price") else ""
+            gone = any(key in pl["name"].lower() and
+                       data["providers"].get(key, {}).get("state") == "inactive" for key in FETCH)
             if pl["next"]:
                 days = (pl["next"] - datetime.now(ZONE).date()).days
-                print(f"  {pl['name']:<24} renews in {days}d ({pl['next']:%d %b}){price}")
+                mark = col("  \u00b7 not active", "33") if gone else ""
+                print(f"  {pl['name']:<24} renews in {days}d ({pl['next']:%d %b}){price}{mark}")
             else:
                 print(f"  {pl['name']:<24} {col('renew_day not set \u2192 ~/.config/aiusage/config.toml', '2')}")
     if verbose and data["providers"]:

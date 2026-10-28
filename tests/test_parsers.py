@@ -1,5 +1,5 @@
 """Parser self-checks for aiusage. Run: python3 tests/test_parsers.py"""
-import contextlib, importlib.machinery, importlib.util, io, os, shutil, sys, tempfile, unittest
+import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, sqlite3, sys, tempfile, time, unittest
 from datetime import date, timedelta, timezone
 
 sys.dont_write_bytecode = True  # keep the repo free of __pycache__
@@ -82,6 +82,130 @@ class Parsers(unittest.TestCase):
         self.assertEqual(au.next_renewal(5, date(2026, 2, 10)), date(2026, 3, 5))
         self.assertEqual(au.next_renewal(20, date(2026, 2, 10)), date(2026, 2, 20))
         self.assertEqual(au.next_renewal(15, date(2026, 12, 20)), date(2027, 1, 15))
+
+
+def boom(exc):
+    def raiser(*_a, **_k):
+        raise exc
+    return raiser
+
+
+class PlanStates(unittest.TestCase):
+    """A lapsed subscription is a state to report, not a read failure to shout about."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_claude_lapsed_plan_is_reported_not_an_error(self):
+        creds = os.path.join(self.tmp, "creds.json")
+        with open(creds, "w") as fh:
+            json.dump({"claudeAiOauth": {"accessToken": "t", "refreshToken": "r",
+                                         "expiresAt": int(time.time() * 1000) + 3_600_000,
+                                         "subscriptionType": "pro"}}, fh)
+        old = au.CLAUDE_CREDS, au._claude_usage, au.claude_refresh
+        au.CLAUDE_CREDS = creds
+        au._claude_usage = boom(au.CliError(
+            'HTTP 403 {"type":"error","error":{"type":"permission_error","message":'
+            '"OAuth authentication is currently not allowed for this organization."}}'))
+        au.claude_refresh = boom(AssertionError("a lapsed plan must not trigger a token refresh"))
+        try:
+            p = au.fetch_claude()
+        finally:
+            au.CLAUDE_CREDS, au._claude_usage, au.claude_refresh = old
+        self.assertEqual(p["state"], "inactive")
+        self.assertEqual(p["windows"], [])
+        self.assertEqual(p["title"], "Claude (pro)")
+        self.assertIn("plan not active", p["source"])
+        self.assertIn("run `claude`", p["notes"][0])
+
+    def test_codex_without_windows_is_inactive(self):
+        old = au.codex_rpc
+        au.codex_rpc = lambda *_a, **_k: {"rateLimits": {"planType": None,
+                                                         "credits": {"hasCredits": False}}}
+        try:
+            p = au.fetch_codex()
+        finally:
+            au.codex_rpc = old
+        self.assertEqual(p["state"], "inactive")
+        self.assertEqual(p["title"], "Codex")
+        self.assertIn("ChatGPT", p["notes"][0])
+
+    def test_codex_free_plan_is_flagged_but_still_shown(self):
+        old = au.codex_rpc
+        au.codex_rpc = lambda *_a, **_k: {"rateLimits": {
+            "primary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": 1792168629},
+            "planType": "free", "credits": {"hasCredits": False}}}
+        try:
+            p = au.fetch_codex()
+        finally:
+            au.codex_rpc = old
+        self.assertEqual(len(p["windows"]), 1)
+        self.assertNotIn("state", p)
+        self.assertTrue(any("no paid ChatGPT quota" in n for n in p["notes"]))
+
+    def opencode_db(self):
+        db = os.path.join(self.tmp, "opencode.db")
+        con = sqlite3.connect(db)
+        con.execute("create table credential (integration_id text, active int, "
+                    "time_updated int, value text)")
+        con.execute("insert into credential values ('opencode', 1, 1, ?)",
+                    (json.dumps({"key": "k"}),))
+        con.commit()
+        con.close()
+        return db
+
+    def test_opencode_lapsed_plan_is_inactive(self):
+        old = au.OPENCODE_DB, au.http_json
+        au.OPENCODE_DB = self.opencode_db()
+        au.http_json = boom(au.CliError(
+            'HTTP 403 {"error":{"type":"EntitlementError","message":'
+            '"OpenCode Go subscription required."}}'))
+        try:
+            p = au.fetch_opencode()
+        finally:
+            au.OPENCODE_DB, au.http_json = old
+        self.assertEqual(p["state"], "inactive")
+        self.assertEqual(p["windows"], [])
+        self.assertIn("Go subscription", p["notes"][0])
+
+    def test_opencode_bad_key_is_still_an_error(self):
+        old = au.OPENCODE_DB, au.http_json
+        au.OPENCODE_DB = self.opencode_db()
+        au.http_json = boom(au.CliError('HTTP 401 {"error":{"type":"AuthError"}}'))
+        try:
+            with self.assertRaises(au.CliError):
+                au.fetch_opencode()
+        finally:
+            au.OPENCODE_DB, au.http_json = old
+
+    def test_opencode_non_billing_403_stays_an_error(self):
+        old = au.OPENCODE_DB, au.http_json
+        au.OPENCODE_DB = self.opencode_db()
+        au.http_json = boom(au.CliError('HTTP 403 <html>error 1010: blocked</html>'))
+        try:
+            with self.assertRaises(au.CliError):
+                au.fetch_opencode()
+        finally:
+            au.OPENCODE_DB, au.http_json = old
+
+    def test_inactive_renders_and_serialises(self):
+        p = au.inactive("Claude (pro)", "renew it, then run `claude` once")
+        data = {"generated_at": au.now(), "errors": {}, "plans": [
+                    {"name": "Claude Pro", "price": "$20/mo", "renew_day": 27,
+                     "next": date(2026, 11, 27)}],
+                "providers": {"claude": p}}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            au.render(data, verbose=False)
+        out = buf.getvalue()
+        self.assertIn("plan not active", out)
+        self.assertIn("run `claude`", out)
+        self.assertEqual(out.count("not active"), 2)   # the section and its plan renewal line
+        self.assertNotIn("\u26a0", out)
+        self.assertEqual(au.jsonable(data)["providers"]["claude"]["state"], "inactive")
 
 
 class Timezone(unittest.TestCase):

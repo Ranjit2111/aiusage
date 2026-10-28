@@ -15,7 +15,7 @@ I got tired of checking three dashboards before starting a long agent run, so th
 | `aiusage` | all three providers, pretty |
 | `aiusage claude` / `codex` / `opencode` | one provider |
 | `aiusage plans` | renewal countdowns only |
-| `aiusage --json` | machine readable, includes the `timezone` in use, exit 1 if any provider errored |
+| `aiusage --json` | machine readable: the `timezone` in use, `state` on a provider whose plan ended, exit 1 if any provider errored |
 | `aiusage -v` | extras plus the `ccusage` token and cost table |
 | `aiusage tz` | show the current timezone |
 | `aiusage tz Asia/Kolkata` | set it, once |
@@ -47,6 +47,10 @@ The value lands in `~/.config/aiusage/config.toml` as `timezone = "..."` and is 
 | OpenCode Go | key from `~/.local/share/opencode/opencode.db`, then `opencode.ai/zen/go/v1/usage` | live |
 
 Nothing is uploaded anywhere. The only network calls are to those provider endpoints, with the credentials already on the machine.
+
+## When a plan ends
+
+A lapsed subscription is not an error. That section still appears, says `plan not active`, and prints the one step that fixes it; the matching entry under `Plans` is marked `not active` too. In `--json` the provider carries `"state": "inactive"` with an empty `windows` list, so a script can skip that runtime. Only a provider that cannot be read at all counts as an error.
 
 ## Install
 
