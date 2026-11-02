@@ -530,7 +530,8 @@ def fetch_opencode():
     con = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True)
     try:
         row = con.execute(
-            "select value from credential where integration_id='opencode' and active=1 "
+            # opencode v2.2.5 stores this as 'opencode-go', older builds as 'opencode'
+            "select value from credential where integration_id like 'opencode%' and active=1 "
             "order by time_updated desc limit 1").fetchone()
     except sqlite3.Error as e:
         raise CliError(f"opencode.db: {e}") from e

@@ -151,7 +151,7 @@ class PlanStates(unittest.TestCase):
         con = sqlite3.connect(db)
         con.execute("create table credential (integration_id text, active int, "
                     "time_updated int, value text)")
-        con.execute("insert into credential values ('opencode', 1, 1, ?)",
+        con.execute("insert into credential values ('opencode-go', 1, 1, ?)",
                     (json.dumps({"key": "k"}),))
         con.commit()
         con.close()
